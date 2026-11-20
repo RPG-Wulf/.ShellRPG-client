@@ -86,3 +86,4 @@ htmlcov/
 # --- Niemals ausschließen: Quellcode und Tests ---
 !src/
 !tests/
+/.agents/
