@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["psutil>=5.9"]
 
+[project.scripts]
+shellrpg-client = "shellrpg_client.app:main"
+
 [project.optional-dependencies]
 test = ["pytest>=9,<10"]
 dev = ["pytest>=9,<10"]

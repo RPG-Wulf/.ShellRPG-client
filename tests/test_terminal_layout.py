@@ -50,7 +50,9 @@ def make_snapshot() -> dict:
     }
 
 
-def test_compact_status_lines_stay_within_terminal_width() -> None:
+def test_compact_status_lines_stay_within_terminal_width(monkeypatch) -> None:
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    monkeypatch.setenv('TERM', 'xterm-256color')
     lines = compact_status_lines(make_snapshot(), spinner_index=2, columns=48)
     assert len(lines) == HEADER_ROWS
     assert all(len(strip_ansi(line)) <= 47 for line in lines)

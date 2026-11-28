@@ -1,93 +1,116 @@
-# ShellRPG Datei-Banner | Terminal-Layout | Deutsch kommentiert
+# Terminal dimensions use visible cells and exclude ANSI SGR bytes.
 from __future__ import annotations
 
 import os
 import re
 import shutil
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
 ANSI = "\x1b["
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+SGR_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 ELLIPSIS = "..."
 
 
-# Entfernt ANSI-Sequenzen, damit Breitenberechnungen nicht von Farb-Codes verfälscht werden.
 def strip_ansi(text: str) -> str:
     return ANSI_PATTERN.sub("", text)
 
 
-# Begrenzt einen Text auf eine sichtbare Zielbreite und hängt bei Bedarf eine Ellipse an.
+def _cell_width(character: str) -> int:
+    if unicodedata.category(character) in {"Mn", "Me"}:
+        return 0
+    if unicodedata.east_asian_width(character) in {"W", "F"}:
+        return 2
+    return 1
+
+
+def _printable(text: str) -> str:
+    return "".join(character for character in text if character.isprintable())
+
+
+def display_width(text: str) -> int:
+    return sum(_cell_width(character) for character in _printable(strip_ansi(text)))
+
+
 def fit_text_width(text: str, max_visible: int) -> str:
-    inline = str(text).replace("\r", " ").replace("\n", " ")
-    clean = strip_ansi(inline)
     if max_visible <= 0:
         return ""
-    if len(clean) <= max_visible:
-        return inline
-    if max_visible <= len(ELLIPSIS):
-        return clean[:max_visible]
-    limit = max_visible - len(ELLIPSIS)
-    visible = 0
-    pos = 0
-    parts: list[str] = []
-    saw_ansi = False
+    inline = str(text).replace("\r", " ").replace("\n", " ")
+    chunks: list[str] = []
+    position = 0
     for match in ANSI_PATTERN.finditer(inline):
-        chunk = inline[pos:match.start()]
-        take = max(0, min(len(chunk), limit - visible))
-        if take:
-            parts.append(chunk[:take])
-            visible += take
-        if visible >= limit:
-            break
-        parts.append(match.group(0))
-        saw_ansi = True
-        pos = match.end()
-    if visible < limit:
-        chunk = inline[pos:]
-        take = max(0, min(len(chunk), limit - visible))
-        if take:
-            parts.append(chunk[:take])
-            visible += take
-    reset = f"{ANSI}0m" if saw_ansi else ""
-    return "".join(parts) + reset + ELLIPSIS
+        chunks.append(_printable(inline[position:match.start()]))
+        if SGR_PATTERN.fullmatch(match.group()):
+            chunks.append(match.group())
+        position = match.end()
+    chunks.append(_printable(inline[position:]))
+    clean = "".join(chunks)
+    if display_width(clean) <= max_visible:
+        if SGR_PATTERN.search(clean) and not clean.endswith(f"{ANSI}0m"):
+            clean += f"{ANSI}0m"
+        return clean
+
+    marker = ELLIPSIS if max_visible >= len(ELLIPSIS) else "." * max_visible
+    budget = max_visible - len(marker)
+    parts: list[str] = []
+    visible = 0
+    colored = False
+    for chunk in chunks:
+        if SGR_PATTERN.fullmatch(chunk):
+            parts.append(chunk)
+            colored = True
+            continue
+        for character in chunk:
+            width = _cell_width(character)
+            if visible + width > budget:
+                reset = f"{ANSI}0m" if colored else ""
+                return "".join(parts) + reset + marker
+            parts.append(character)
+            visible += width
+    return "".join(parts) + (f"{ANSI}0m" if colored else "") + marker
 
 
-# Füllt einen Text nach dem Kürzen auf eine feste sichtbare Breite auf.
 def pad_text_width(text: str, max_visible: int, align: str = "left") -> str:
     fitted = fit_text_width(text, max_visible)
-    visible_len = len(strip_ansi(fitted))
-    padding = max(0, max_visible - visible_len)
+    padding = max(0, max_visible - display_width(fitted))
     if align == "center":
         left = padding // 2
-        right = padding - left
-        return (" " * left) + fitted + (" " * right)
+        return (" " * left) + fitted + (" " * (padding - left))
     if align == "right":
         return (" " * padding) + fitted
     return fitted + (" " * padding)
 
 
-# Kürzt eine Terminalzeile so, dass sie garantiert innerhalb einer physischen Konsolenzeile bleibt.
 def fit_plain_terminal_line(text: str, columns: int) -> str:
-    return fit_text_width(text, max(1, columns - 1))
+    return fit_text_width(text, columns - 1)
 
 
-# Baut einen PowerShell-aehnlichen Prompt und kuerzt den Pfad notfalls von links.
-def format_shell_prompt(cwd: Path, columns: int) -> str:
-    prefix = "PS "
-    suffix = "> "
-    max_visible = max(1, columns - 1)
-    available = max(1, max_visible - len(prefix) - len(suffix))
-    path_text = str(cwd)
-    if len(path_text) > available:
-        if available <= len(ELLIPSIS):
-            path_text = path_text[-available:]
-        else:
-            tail = max(1, available - len(ELLIPSIS))
-            path_text = ELLIPSIS + path_text[-tail:]
-    return fit_text_width(f"{prefix}{path_text}{suffix}", max_visible)
+def format_shell_prompt(cwd: Path, columns: int, *, colored: bool = False) -> str:
+    prefix, suffix = "PS ", "> "
+    if columns <= len(prefix) + len(suffix):
+        return "> "[:max(0, columns - 1)]
+
+    budget = columns - 1 - len(prefix) - len(suffix)
+    path_text = _printable(strip_ansi(str(cwd)))
+    if display_width(path_text) > budget:
+        marker = ELLIPSIS if budget > len(ELLIPSIS) else ""
+        remaining = budget - len(marker)
+        tail: list[str] = []
+        for character in reversed(path_text):
+            width = _cell_width(character)
+            if width > remaining:
+                break
+            tail.append(character)
+            remaining -= width
+        path_text = marker + "".join(reversed(tail))
+    prompt = f"{prefix}{path_text}{suffix}"
+    if colored:
+        return f"{ANSI}1;96m{prefix}{ANSI}0m{path_text}{ANSI}1;96m{suffix}{ANSI}0m"
+    return prompt
 
 
 @dataclass
@@ -96,6 +119,7 @@ class ReservedTerminalRenderer:
     stream: TextIO = sys.stdout
     fallback_columns: int = 100
     fallback_lines: int = 30
+    use_cursor: bool = True
 
     # Liest die aktuelle Terminalgroesse und faellt fuer Tests oder Pipes auf sichere Standardwerte zurueck.
     def terminal_size(self) -> os.terminal_size:  # type: ignore[name-defined]
@@ -124,7 +148,7 @@ class ReservedTerminalRenderer:
 
     # Bereinigt die aktuelle Prompt-Zeile und schreibt den neuen Eingabeprompt kontrolliert an dieselbe Stelle.
     def write_prompt(self, prompt_text: str) -> None:
-        self.stream.write(f"{ANSI}2K\r{prompt_text}")
+        self.stream.write(f"{ANSI}2K\r{prompt_text}" if self.use_cursor else prompt_text)
         self.stream.flush()
 
     # Stellt nach einem Wizard-Schritt den Prompt-Anker wieder her, ohne den Verlauf zu verschieben.

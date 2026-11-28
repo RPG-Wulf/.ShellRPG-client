@@ -22,6 +22,8 @@ except Exception:  # pragma: no cover - optionale Komfortabhängigkeit
     psutil = None
 
 from shellrpg_client.api_client import ApiClient
+from shellrpg_client.discovery import discover
+from shellrpg_client.prompt_hud import GATE_ART, ansi_colors_enabled, updatewulf_line
 from shellrpg_client.terminal_layout import (
     ReservedRenderSession,
     ReservedTerminalRenderer,
@@ -149,7 +151,7 @@ def write_profile(profile: dict[str, Any]) -> None:
 
 # Gibt einen Text optional mit ANSI-Farbe zurück, wenn die Konsole ANSI versteht.
 def color(text: str, code: str) -> str:
-    return f"{ANSI}{code}m{text}{ANSI}0m"
+    return f"{ANSI}{code}m{text}{ANSI}0m" if ansi_colors_enabled() else text
 
 
 # Ermittelt lokal sichtbare Netzwerkschnittstellen, WLAN-Hinweise und harmlose Pseudoprotokolle für den Fake-Boot.
@@ -1705,6 +1707,7 @@ class LiveContext:
     last_media_file: str = ""
     matrix_snapshot: dict[str, Any] | None = None
     last_matrix_refresh_ts: float = 0.0
+    reserved_rows: int = 0
     render_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
@@ -1738,15 +1741,24 @@ def render_live_prompt(
     reserve_rows: bool = True,
     write_prompt: bool = True,
 ) -> None:
-    columns = renderer.terminal_size().columns
+    columns, rows = renderer.terminal_size()
+    budget = min(max(0, rows - 1), HEADER_ROWS + 1 + len(GATE_ART)) if columns >= 12 else 0
     if reserve_rows:
-        renderer.reserve(HEADER_ROWS)
-    renderer.draw_above_anchor(
-        compact_status_lines(context.snapshot, context.spinner_index, columns, matrix_snapshot=context.matrix_snapshot),
-        HEADER_ROWS,
-    )
+        context.reserved_rows = budget if renderer.use_cursor else 0
+        renderer.reserve(context.reserved_rows)
+    owned_rows = min(context.reserved_rows, budget)
+    if owned_rows and columns >= 12:
+        lines = []
+        if update_line := updatewulf_line():
+            lines.append(fit_plain_terminal_line(color(update_line, "1;92"), columns))
+        if columns >= 36 and owned_rows >= HEADER_ROWS + len(GATE_ART) + len(lines):
+            lines.extend(color(line, "1;36") for line in GATE_ART)
+        lines.extend(
+            compact_status_lines(context.snapshot, context.spinner_index, columns, matrix_snapshot=context.matrix_snapshot)
+        )
+        renderer.draw_above_anchor(lines[:owned_rows], owned_rows)
     if write_prompt:
-        renderer.write_prompt(format_shell_prompt(cwd, columns))
+        renderer.write_prompt(format_shell_prompt(cwd, columns, colored=renderer.use_cursor and ansi_colors_enabled()))
 
 
 def _status_pulse_seconds(snapshot: dict) -> float:
@@ -1757,8 +1769,6 @@ def _status_pulse_seconds(snapshot: dict) -> float:
 def start_live_status_pulse(
     api: ApiClient,
     context: LiveContext,
-    renderer: ReservedTerminalRenderer,
-    cwd_ref: dict[str, Path],
 ) -> tuple[threading.Event, threading.Thread | None]:
     if not sys.stdin.isatty():
         return threading.Event(), None
@@ -1777,7 +1787,6 @@ def start_live_status_pulse(
                     except Exception:
                         pass
                     next_server_refresh = now + _status_pulse_seconds(context.snapshot)
-                render_live_prompt(renderer, context, cwd_ref["path"], reserve_rows=False, write_prompt=False)
 
     thread = threading.Thread(target=pulse_loop, name="shellrpg-live-status-pulse", daemon=True)
     thread.start()
@@ -1797,7 +1806,9 @@ def maybe_render_media(renderer: str | None, media_file: str) -> str:
     if not renderer or not media_file:
         return ""
     path = Path(media_file)
-    if not path.exists():
+    if not path.is_file() and not path.is_absolute() and ".." not in path.parts:
+        path = Path(__file__).resolve().parents[2] / path
+    if not path.is_file():
         return ""
     try:
         if renderer == "chafa":
@@ -1844,24 +1855,41 @@ def print_command_feedback(snapshot: dict, command: str, renderer: str | None) -
 # Führt den Hauptloop des Clients aus und verbindet Shell-Kommandos, Spielkommandos, Intro und Charaktererstellung.
 def main(argv: list[str] | None = None) -> int:
     enable_ansi_support()
-    renderer = ReservedTerminalRenderer()
+    tty = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+    renderer = ReservedTerminalRenderer(use_cursor=tty)
     parser = argparse.ArgumentParser(description=f"ShellRPG terminal Phase {RELEASE_VERSION} client")
-    parser.add_argument("--server", default="http://127.0.0.1:8765", help="Basis-URL des ShellRPG-Servers.")
+    parser.add_argument("--server", help="Basis-URL des ShellRPG-Servers. Standard: bekannte Hosts prüfen.")
+    parser.add_argument("--discover", action="store_true", help="Gibt die URL des ersten verfügbaren ShellRPG-Servers aus.")
     parser.add_argument("--command", help="Führt genau ein Spielkommando aus und beendet sich dann.")
     parser.add_argument("--skip-intro", action="store_true", help="Überspringt Intro und Fake-Boot, nützlich für Tests.")
     parser.add_argument("--new-character", action="store_true", help="Erzwingt die Charaktererstellung auch dann, wenn bereits ein Profil existiert.")
+    parser.add_argument("--ascii", action="store_true", help="Zeigt das Graufurter Tor in ASCII.")
     args = parser.parse_args(argv)
+    if args.ascii:
+        print("\n".join(GATE_ART))
+        return 0
 
-    run_fake_boot(args.skip_intro, renderer=renderer)
     profile = None if args.new_character else read_profile()
+    known = str((profile or {}).get("server_url", ""))
+    try:
+        endpoint = args.server or discover(known)
+    except ConnectionError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if args.discover:
+        print(endpoint)
+        return 0
+
+    run_fake_boot(args.skip_intro or not tty, renderer=renderer)
     provisional_name = (profile or {}).get("character_name", "Neowulf")
-    player_account_id = str((profile or {}).get("player_account_id", ""))
-    device_id = str((profile or {}).get("device_id", ""))
+    reuse_identity = not known or known.rstrip("/") == endpoint.rstrip("/")
+    player_account_id = str((profile or {}).get("player_account_id", "")) if reuse_identity else ""
+    device_id = str((profile or {}).get("device_id", "")) if reuse_identity else ""
     current_cwd = Path.cwd()
 
     try:
         api = ApiClient(
-            args.server,
+            endpoint,
             character_name=provisional_name,
             player_account_id=player_account_id,
             device_id=device_id or None,
@@ -1892,6 +1920,7 @@ def main(argv: list[str] | None = None) -> int:
             api.create_character(profile)
             profile["player_account_id"] = api.player_account_id
             profile["device_id"] = api.device_id
+            profile["server_url"] = endpoint
             write_profile(profile)
         except Exception as exc:
             print(f"Charaktererstellung fehlgeschlagen: {exc}")
@@ -1904,6 +1933,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     profile = sync_profile_identity(dict(profile or {"character_name": api.character_name}), api, snapshot=bootstrap)
+    profile["server_url"] = endpoint
     write_profile(profile)
 
     context = LiveContext(snapshot=bootstrap)
@@ -1943,7 +1973,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cwd = current_cwd
-    cwd_ref = {"path": cwd}
     media_renderer = detect_media_renderer()
     print(color("Spielbefehle und Shell-Befehle teilen sich jetzt denselben Prompt. 'quit' oder 'exit' beendet nur den Client.", "90"))
     while True:
@@ -1953,7 +1982,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 pass
             render_live_prompt(renderer, context, cwd)
-        stop_pulse, pulse_thread = start_live_status_pulse(api, context, renderer, cwd_ref)
+        stop_pulse, pulse_thread = start_live_status_pulse(api, context)
         try:
             raw = input("").strip()
         finally:
@@ -2001,7 +2030,6 @@ def main(argv: list[str] | None = None) -> int:
             print_command_feedback(snapshot, raw, media_renderer)
             continue
         cwd, shell_output = run_shell_command(raw, cwd, capture_output=False)
-        cwd_ref["path"] = cwd
         if shell_output:
             print(shell_output)
         else:

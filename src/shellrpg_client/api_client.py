@@ -24,7 +24,7 @@ class ApiClient:
         self.base_url = base_url.rstrip("/")
         self.character_name = character_name
         self.player_account_id = player_account_id
-        self.device_id = device_id or self._local_device_id()
+        self.device_id = device_id or secrets.token_hex(24)
         self.available_auth_providers: list[dict] = []
         self.session_token = ""
         self.last_live_event_id = 0
@@ -71,7 +71,7 @@ class ApiClient:
         payload = json.dumps(self._login_payload()).encode("utf-8")
         req = request.Request(f"{self.base_url}/api/login", data=payload, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with request.urlopen(req) as response:
+            with request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (URLError, HTTPError, RemoteDisconnected, ConnectionError) as exc:
             raise ConnectionError(f"Login zum ShellRPG-Server fehlgeschlagen: {exc}") from exc
@@ -86,7 +86,7 @@ class ApiClient:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         req = request.Request(f"{self.base_url}{path}", data=data, headers=self._headers(), method=method)
         try:
-            with request.urlopen(req) as response:
+            with request.urlopen(req, timeout=10) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 self._remember_live_event(payload)
                 return payload
@@ -94,7 +94,7 @@ class ApiClient:
             self.login()
             req = request.Request(f"{self.base_url}{path}", data=data, headers=self._headers(), method=method)
             try:
-                with request.urlopen(req) as response:
+                with request.urlopen(req, timeout=10) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                     self._remember_live_event(payload)
                     return payload
